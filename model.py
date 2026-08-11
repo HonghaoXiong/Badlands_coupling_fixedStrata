@@ -73,6 +73,7 @@ class Model(object):
         self.pelaval = None
         self.applyDisp = False
         self.simStarted = False
+        self.strat_write = 0 # disable stratigraphic output first time
 
     def load_xml(self, filename, verbose=False):
         """
@@ -93,6 +94,21 @@ class Model(object):
 
         # Only the first node should create a unique output dir
         self.input = xmlParser.xmlParser(filename, makeUniqueOutputDir=True)
+        import xml.etree.ElementTree as etree
+
+        try:
+            _root = etree.parse(filename).getroot()
+            _strata = _root.find("strata")
+            self.input.strata_enabled = _strata is not None
+        except Exception:
+            self.input.strata_enabled = True
+
+        if not getattr(self.input, "strata_enabled", True):
+            self.input.laytime = 0.0
+            self.input.stratdx = 0.0
+            if hasattr(self.input, "laststrat"):
+                self.input.laststrat = False
+
         self.tNow = self.input.tStart
 
         # Seed the random number generator consistently on all nodes
@@ -204,7 +220,7 @@ class Model(object):
             if self.input.waveSed:
                 self.force.next_wave = self.input.tStart + self.input.tWave
             else:
-                self.force.next_wave = self.input.tEnd + 1.0e5
+                self.force.next_wave = np.inf
 
         if self.input.carb:
 
@@ -213,7 +229,7 @@ class Model(object):
             if self.carbTIN is not None:
                 self.prop = np.zeros((self.totPts, self.carbTIN.nbSed))
         else:
-            self.next_carbStep = self.input.tEnd + 1.0e5
+            self.next_carbStep = np.inf
             self.prop = np.zeros((self.totPts, 1))
 
     def _rebuild_mesh(self, verbose=False):
@@ -257,7 +273,7 @@ class Model(object):
             self.wave.build_tree(self.FVmesh.node_coords[:, :2])
 
         # Update stratigraphic mesh
-        if self.input.stratdx > 0:
+        if self.strata is not None and self.input.stratdx > 0:
             self.strata.update_TIN(self.FVmesh.node_coords[:, :2])
 
         # Update erodibility maps
@@ -287,29 +303,35 @@ class Model(object):
         self.pelaval = None
         self.prop = np.zeros((self.totPts, 1))
 
-    def run_to_time(self, tEnd, verbose=False, generate_udw_strata=True):
+    def run_to_time(self, tEnd, verbose=False):
         """
         Run the simulation to a specified point in time.
 
         Args:
             tEnd : (float) time in years up to run the model for...
             verbose : (bool) when :code:`True`, output additional debug information (default: :code:`False`).
-            generate_udw_strata : (bool) when :code:`True`, generate strata output for Underworld coupling (default: :code:`True`).
 
         Warning:
             If specified end time (**tEnd**) is greater than the one defined in the XML input file priority
-            is given to the XML value.
+            is given to the XML value. If run from Underworld (or UWGeo) use tEnd not from XML file.
         """
 
         assert hasattr(
             self, "recGrid"
         ), "DEM file has not been loaded. Configure one in your XML file or call the build_mesh function."
 
-        if tEnd > self.input.tEnd:
+        # use the smallest tEnd, either passing or from the XML - when udw coupling is disabled
+        if (self.input.tEnd < tEnd) and (self.input.udw == 0):
             print(
-                "Specified end time is greater than the one used in the XML input file and has been adjusted!"
+            "Specified `tEnd` is greater than `tEnd` in the XML input file. Using the XML definition as it's smaller!"
             )
             tEnd = self.input.tEnd
+
+        # reference var within loop
+        tStart   = self.input.tStart
+        ftime    = self.input.ftime
+        tDisplay = self.input.tDisplay
+        laytime  = self.input.laytime
 
         # Define non-flow related processes times
         if not self.simStarted:
@@ -317,19 +339,17 @@ class Model(object):
             self.force.next_disp = self.force.T_disp[0, 0]
             self.force.next_carb = self.force.T_carb[0, 0]
 
-            self.force.next_display = self.input.tStart
-            if self.input.laytime > 0:
-                self.force.next_layer = self.input.tStart + self.input.laytime
+            self.force.next_display = tStart
+            if laytime > 0:
+                self.force.next_layer = tStart + laytime
             else:
-                self.force.next_layer = self.input.tEnd + 1000.0
-            self.exitTime = self.input.tEnd
+                self.force.next_layer = np.inf
             if self.input.flexure:
-                self.force.next_flexure = self.input.tStart + self.input.ftime
+                self.force.next_flexure = tStart + ftime
             else:
-                self.force.next_flexure = self.exitTime + self.input.tDisplay
+                self.force.next_flexure = np.inf
             self.simStarted = True
 
-        outStrata = 0
         last_time = time.process_time()
         last_output = time.process_time()
 
@@ -345,9 +365,9 @@ class Model(object):
             # Load precipitation rate
             if (
                 self.force.next_rain <= self.tNow
-                and self.force.next_rain < self.input.tEnd
+                and self.force.next_rain < tEnd
             ):
-                if self.tNow == self.input.tStart:
+                if self.tNow == tStart:
                     ref_elev = buildMesh.get_reference_elevation(
                         self.input, self.recGrid, self.elevation
                     )
@@ -358,7 +378,7 @@ class Model(object):
                 )
 
             # Initialize waveFlux at tStart
-            # if self.tNow == self.input.tStart:
+            # if self.tNow == tStart:
             #     self.force.initWaveFlux(self.inIDs)
 
             # Load tectonic grid
@@ -366,7 +386,7 @@ class Model(object):
                 # Vertical displacements
                 if (
                     self.force.next_disp <= self.tNow
-                    and self.force.next_disp < self.input.tEnd
+                    and self.force.next_disp < tEnd
                 ):
                     ldisp = np.zeros(self.totPts, dtype=float)
                     ldisp.fill(-1.0e6)
@@ -382,9 +402,9 @@ class Model(object):
                 # 3D displacements
                 if (
                     self.force.next_disp <= self.tNow
-                    and self.force.next_disp < self.input.tEnd
+                    and self.force.next_disp < tEnd
                 ):
-                    if self.input.laytime == 0:
+                    if laytime == 0:
                         updateMesh = self.force.load_Disp_map(
                             self.tNow, self.FVmesh.node_coords[:, :2], self.inIDs
                         )
@@ -423,7 +443,7 @@ class Model(object):
                         sload = None
                         if (
                             self.input.udw == 1
-                            and self.tNow == self.input.tStart
+                            and self.tNow == tStart
                             and self.strata is not None
                         ):
                             if self.strata.oldload is None:
@@ -435,7 +455,7 @@ class Model(object):
                                 self.strata.oldload = np.zeros(
                                     len(self.elevation), dtype=float
                                 )
-                        if self.input.laytime > 0 and self.strata.oldload is not None:
+                        if laytime > 0 and self.strata.oldload is not None:
                             sload = self.strata.oldload
                             fstrat = 1
                         # Define erodibility map flags
@@ -489,7 +509,7 @@ class Model(object):
                             self.elevation += self.force.uDisp
 
                         # Update the stratigraphic mesh
-                        if self.input.laytime > 0 and self.strata is not None:
+                        if laytime > 0 and self.strata is not None:
                             self.strata.move_mesh(regdX, regdY, scum, verbose)
 
             # Compute isostatic flexure
@@ -517,7 +537,7 @@ class Model(object):
                 self.elevation += self.tinFlex
                 self.cumflex += self.tinFlex
                 # Update next flexure time
-                self.force.next_flexure += self.input.ftime
+                self.force.next_flexure += ftime
                 print(
                     "   - Compute flexural isostasy %0.02f seconds"
                     % (time.process_time() - flextime)
@@ -584,7 +604,7 @@ class Model(object):
                     # Load carbonate growth rates for species 1 and 2 during a given growth event
                     if (
                         self.force.next_carb <= self.tNow
-                        and self.force.next_carb < self.input.tEnd
+                        and self.force.next_carb < tEnd
                     ):
                         (
                             self.carbMaxGrowthSp1,
@@ -655,30 +675,26 @@ class Model(object):
                 )
 
             # Update next stratal layer time
-            if self.tNow >= self.force.next_layer:
-                self.force.next_layer += self.input.laytime
+            if self.strata is not None and laytime > 0 and self.tNow >= self.force.next_layer:
+                self.force.next_layer += laytime
                 if self.straTIN is not None:
                     self.straTIN.step += 1
-                if self.input.laststrat == True:
-                   outStrata=0
-                if self.strata:
-                    if self.tNow==tEnd: 
-                        self.write=1 # set parameter to call hdf5 stratal writer on final strat only
-                    else:
-                        self.write=0
-                    if self.input.laststrat == False:
-                        self.write=outStrata #revert to previous behaviour by default
-                    sub = self.strata.buildStrata(
-                        self.elevation,
-                        self.cumdiff,
-                        self.force.sealevel,
-                        self.recGrid.boundsPt,
-                        self.write,
-                        self.outputStep,
-                    )
-                    self.elevation += sub
-                    self.cumdiff += sub
-                outStrata = 0
+                if self.tNow == tEnd:
+                    self.strat_write = 1
+                else:
+                    self.strat_write = 0
+                if self.input.laststrat == False:
+                    self.strat_write = 1
+                sub = self.strata.buildStrata(
+                    self.elevation,
+                    self.cumdiff,
+                    self.force.sealevel,
+                    self.recGrid.boundsPt,
+                    self.strat_write,
+                    self.outputStep,
+                )
+                self.elevation += sub
+                self.cumdiff += sub
 
             # Compute stream network
             self.fillH, self.elevation = buildFlux.streamflow(
@@ -697,8 +713,7 @@ class Model(object):
 
             # Create checkpoint files and write HDF5 output
             if self.tNow >= self.force.next_display:
-                if self.force.next_display > self.input.tStart:
-                    outStrata = 1
+                # if self.force.next_display > tStart:
                 checkPoints.write_checkpoints(
                     self.input,
                     self.recGrid,
@@ -722,24 +737,24 @@ class Model(object):
                 )
 
                 if self.straTIN is not None and self.outputStep % self.input.tmesh == 0:
-                    meshtime = time.process_time()
-                    self.straTIN.write_hdf5_stratigraphy(self.lGIDs, self.outputStep)
-                    print(
-                        "   - Write sediment mesh output %0.02f seconds"
-                        % (time.process_time() - meshtime)
-                    )
+                        meshtime = time.process_time()
+                        self.straTIN.write_hdf5_stratigraphy(self.lGIDs, self.outputStep)
+                        print(
+                            "   - Write sediment mesh output %0.02f seconds"
+                            % (time.process_time() - meshtime)
+                        )
 
                 if self.carbTIN is not None and self.outputStep % self.input.tmesh == 0:
-                    meshtime = time.process_time()
-                    self.carbTIN.write_hdf5_stratigraphy(self.lGIDs, self.outputStep)
-                    print(
-                        "   - Write carbonate mesh output %0.02f seconds"
-                        % (time.process_time() - meshtime)
-                    )
+                        meshtime = time.process_time()
+                        self.carbTIN.write_hdf5_stratigraphy(self.lGIDs, self.outputStep)
+                        print(
+                            "   - Write carbonate mesh output %0.02f seconds"
+                            % (time.process_time() - meshtime)
+                        )
 
                 # Update next display time
                 last_output = time.process_time()
-                self.force.next_display += self.input.tDisplay
+                self.force.next_display += tDisplay
                 self.outputStep += 1
                 if self.carbTIN is not None:
                     self.carbTIN.step += 1
@@ -758,39 +773,51 @@ class Model(object):
                 ]
             )
 
-            if tStop < tEnd:
-                (
-                    self.tNow,
-                    self.elevation,
-                    self.cumdiff,
-                    self.cumhill,
-                    self.cumfail,
-                    self.slopeTIN,
-                ) = buildFlux.sediment_flux(
-                    self.input,
-                    self.recGrid,
-                    self.hillslope,
-                    self.FVmesh,
-                    self.flow,
-                    self.force,
-                    self.rain,
-                    self.lGIDs,
-                    self.applyDisp,
-                    self.straTIN,
-                    self.mapero,
-                    self.cumdiff,
-                    self.cumhill,
-                    self.cumfail,
-                    self.fillH,
-                    self.disp,
-                    self.inGIDs,
-                    self.elevation,
-                    self.tNow,
-                    tStop,
-                    verbose,
-                )
-            else:
-                self.tNow = tEnd
+            # Integrate erosion/deposition up to the earliest of the next
+            # scheduled events or tEnd. The original strict `tStop < tEnd`
+            # gate silently skipped sediment_flux whenever every scheduled
+            # event (next_display/next_disp/next_rain/next_layer) coincides
+            # exactly with the step end, which is the normal situation in
+            # the Underworld coupling (cumdiff stayed 0 in that case).
+            fluxTarget = tStop if tStop < tEnd else tEnd
+            (
+                self.tNow,
+                self.elevation,
+                self.cumdiff,
+                self.cumhill,
+                self.cumfail,
+                self.slopeTIN,
+            ) = buildFlux.sediment_flux(
+                self.input,
+                self.recGrid,
+                self.hillslope,
+                self.FVmesh,
+                self.flow,
+                self.force,
+                self.rain,
+                self.lGIDs,
+                self.applyDisp,
+                self.straTIN,
+                self.mapero,
+                self.cumdiff,
+                self.cumhill,
+                self.cumfail,
+                self.fillH,
+                self.disp,
+                self.inGIDs,
+                self.elevation,
+                self.tNow,
+                fluxTarget,
+                verbose,
+            )
+
+        # Under the Underworld coupling, tNow reaches tEnd through accumulated
+        # CFL-limited substeps (integer rounding + minDT floor) and can miss
+        # exact float equality or slightly overshoot. Snap back onto tEnd so
+        # that badlands' clock stays aligned with Underworld's step times and
+        # the post-loop checkpoint condition below is met.
+        if self.tNow >= tEnd:
+            self.tNow = tEnd
 
         tloop = time.process_time() - last_time
         print("tNow = %s (%0.02f seconds)" % (self.tNow, tloop))
@@ -820,49 +847,50 @@ class Model(object):
             self.elevation += self.tinFlex
             self.cumflex += self.tinFlex
             # Update next flexure time
-            self.force.next_flexure += self.input.ftime
+            self.force.next_flexure += ftime
             print(
                 "   - Compute flexural isostasy %0.02f seconds"
                 % (time.process_time() - flextime)
             )
 
         # Update next stratal layer time
-        if self.tNow >= self.force.next_layer:
-            self.force.next_layer += self.input.laytime
+        if self.strata is not None and laytime > 0 and self.tNow >= self.force.next_layer:
+            self.force.next_layer += laytime
             if self.input.laststrat==True: 
-                self.write=1 # set parameter to call hdf5 stratal writer
+                self.strat_write=1 # set parameter to call hdf5 stratal writer
             sub = self.strata.buildStrata(
                 self.elevation,
                 self.cumdiff,
                 self.force.sealevel,
                 self.recGrid.boundsPt,
-                self.write, #was 0
+                self.strat_write,
                 self.outputStep + 1,
             )
             self.elevation += sub
             self.cumdiff += sub
 
         # if Underworld coupling is active, force a strata write at the end
-        if self.input.udw==1 and generate_udw_strata:
+        if self.input.udw == 1 and self.strata is not None and laytime > 0:
             purple = "\033[0;35m"
             endcol = "\033[00m"
             print(purple + "Stratal layering output to align with Underworld coupling" + endcol)
             # force a strata write
-            self.write = 1
-            sub = self.strata.buildStrata(
+            self.strat_write = 1
+            self.strata.buildStrata(
                 self.elevation,
                 self.cumdiff,
                 self.force.sealevel,
                 self.recGrid.boundsPt,
-                self.write,
+                self.strat_write,
                 self.outputStep + 1,
             )
             
         # Create checkpoint files and write HDF5 output
         if (
+            #self.tNow == tEnd
             self.input.udw == 0
-            or self.tNow == self.input.tEnd
-            or self.tNow == self.force.next_display
+            or self.tNow >= tEnd
+            or self.tNow >= self.force.next_display
         ):
             checkPoints.write_checkpoints(
                 self.input,
@@ -902,7 +930,7 @@ class Model(object):
                     % (time.process_time() - meshtime)
                 )
 
-            self.force.next_display += self.input.tDisplay
+            self.force.next_display += tDisplay
             self.outputStep += 1
             if self.straTIN is not None:
                 self.straTIN.write_hdf5_stratigraphy(self.lGIDs, self.outputStep - 1)

@@ -1,112 +1,118 @@
-# Badlands 代码修改指南：控制 Strata 文件生成
-# Badlands Code Modification Guide: Controlling Strata File Generation
+# Badlands Coupling Fix: Strata 可选化 + 耦合输出修复
 
-本指南旨在指导如何修改 Badlands 模型代码 (`model.py`)，以增加一个开关，允许在与 Underworld 耦合 (Coupling) 运行时选择是否生成地层 (Strata) 文件。
+本仓库合并了 Badlands 在与 Underworld2 耦合 (`udw=1`) 时的多项修复，涵盖 strata 文件生成可选化、沉积/侵蚀输出为零、后续步输出丢失、以及重启时缺少 strata 文件等问题。
 
-This guide aims to instruct how to modify the Badlands model code (`model.py`) to add a toggle switch, allowing users to choose whether to generate strata files when running in coupling mode with Underworld.
-
-## 修改目标文件 / Target File
-*   **文件名 (Filename)**: `model.py`
-*   **路径 (Path)**: `/Users/haibinyang/Xiong_test/model.py`
+This repository merges multiple fixes for Badlands when coupled with Underworld2 (`udw=1`), including optional strata generation, zero cumdiff fix, missing output fix, and restart strata bypass.
 
 ---
 
-## 修改步骤 1：增加控制参数
-## Modification Step 1: Add Control Parameter
+## 修改文件列表 / Modified Files
 
-我们需要在主运行函数 `run_to_time` 中增加一个名为 `generate_udw_strata` 的开关参数。
+| 文件 / File | 安装目标路径 / Install Path | 说明 / Description |
+|---|---|---|
+| `model.py` | `badlands/model.py` | strata 可选化（XML 检测）+ cumdiff 修复 + 输出条件修复 |
+| `buildMesh.py` | `badlands/simulation/buildMesh.py` | `laytime=0` 时跳过 stratigraphic TIN 初始化 |
+| `buildFlux.py` | `badlands/simulation/buildFlux.py` | `CFLtime` 在 minDT/maxDT 钳制后追加 `tEnd-tNow` 封顶 |
+| `strataMesh.py` | `badlands/underland/strataMesh.py` | restart 缺少 `sed.time*.hdf5` 时发出警告并继续（bypass） |
 
-We need to add a switch parameter named `generate_udw_strata` to the main execution function `run_to_time`.
+详细修改说明请参见 [Badlands_Strata_Optional_Changes.md](./Badlands_Strata_Optional_Changes.md)。
 
-*   **位置 (Location)**: 第 **290** 行左右 (Around line 290)
-*   **操作 (Action)**: 修改函数定义行，并添加参数说明。 (Modify the function definition line and add parameter description.)
-
-**🔴 修改前 (Original Code):**
-
-```python
-    def run_to_time(self, tEnd, verbose=False):
-        """
-        Run the simulation to a specified point in time.
-
-        Args:
-            tEnd : (float) time in years up to run the model for...
-            verbose : (bool) when :code:`True`, output additional debug information (default: :code:`False`).
-```
-
-**🟢 修改后 (Modified Code):**
-
-```python
-    def run_to_time(self, tEnd, verbose=False, generate_udw_strata=True):
-        """
-        Run the simulation to a specified point in time.
-
-        Args:
-            tEnd : (float) time in years up to run the model for...
-            verbose : (bool) when :code:`True`, output additional debug information (default: :code:`False`).
-            generate_udw_strata : (bool) when :code:`True`, generate strata output for Underworld coupling (default: :code:`True`).
-```
-
-> **解释**: 我们添加了 `generate_udw_strata=True`。这意味着如果你不改动任何调用代码，它默认还是会生成文件（保持原有习惯，安全第一）。只有当你明确说“不要生成”时，它才会听话。
->
-> **Explanation**: We added `generate_udw_strata=True`. This means if you don't change any calling code, it will default to generating files (maintaining original behavior for safety). It will only listen when you explicitly say "do not generate".
+For detailed modification documentation, see [Badlands_Strata_Optional_Changes.md](./Badlands_Strata_Optional_Changes.md).
 
 ---
 
-## 修改步骤 2：应用控制开关
-## Modification Step 2: Apply Control Switch
+## 修复内容概览 / Fix Overview
 
-接下来，我们需要找到真正执行“强制生成文件”的代码块，加上我们的开关判断。
+### 1. Strata 可选化 / Optional Strata (model.py + buildMesh.py)
 
-Next, we need to find the code block that actually performs the "forced file generation" and add our switch condition.
+当 Badlands 被 Underworld 调用 (`udw=1`) 时：
+- **XML 中有 `<strata>`**：正常启用 strata，生成对应输出文件。
+- **XML 中无 `<strata>`**：不生成 strata 输出文件，不影响耦合计算，restart 时不需要 `sed.time*.hdf5`。
 
-*   **位置 (Location)**: 第 **846** 行左右 (Around line 846)
-*   **操作 (Action)**: 在 `if` 判断语句中增加 `and generate_udw_strata` 条件。 (Add the `and generate_udw_strata` condition to the `if` statement.)
+实现方式：在 `load_xml()` 中检测 XML 是否包含 `<strata>` 节点，若无则强制 `laytime=0`、`stratdx=0`，从源头关闭 strata 构建。所有 strata 相关代码路径均加 `self.strata is not None` 守卫。
 
-**🔴 修改前 (Original Code):**
+### 2. cumdiff 始终为 0 的修复 / Zero Cumdiff Fix (model.py)
 
-```python
-        # if Underworld coupling is active, force a strata write at the end
-        if self.input.udw==1:
-            purple = "\033[0;35m"
-            endcol = "\033[00m"
-```
+Underworld 耦合时 `surfaceProcesses.py` 设 `next_display = run_until = tEnd`，导致 `tStop = tEnd`。原代码 `if tStop < tEnd:` 走 else 分支跳过 `sediment_flux`，cumdiff 恒为 0。
 
-**🟢 修改后 (Modified Code):**
+修复：改为 `tStop <= tEnd`（等价写法：`fluxTarget = tStop if tStop < tEnd else tEnd` 并无条件调用 `sediment_flux`）。
 
-```python
-        # if Underworld coupling is active, force a strata write at the end
-        if self.input.udw==1 and generate_udw_strata:
-            purple = "\033[0;35m"
-            endcol = "\033[00m"
-```
+### 3. 后续步输出丢失的修复 / Missing Output Fix (model.py + buildFlux.py)
 
-> **解释**: 原来的代码只要 `udw==1`（开启了 Underworld 模式）就会强制写入。现在我们加了一个条件：必须 `udw==1` **并且** 我们允许生成 (`generate_udw_strata` 为真) 时，才执行写入操作。
->
-> **Explanation**: The original code would force a write as long as `udw==1` (Underworld mode active). Now we added a condition: the write operation is executed only when `udw==1` **AND** we allow generation (`generate_udw_strata` is True).
+修复一后，`outbdls/h5/` 仍只有 `time0`，后续步无输出。根因：
+- `buildFlux.py` 中 `CFLtime = min(CFLtime, tEnd - tNow)` 被 minDT 钳制（默认 1.0 年）重新抬升，导致 `tNow` 越过 `tEnd` 约 1 年。
+- 主循环后输出条件用 `==` 精确比较，越界后不满足。
+
+修复（3 处）：
+1. `model.py`：主循环结束后 `if self.tNow >= tEnd: self.tNow = tEnd`（snap 回收）。
+2. `model.py`：输出条件 `==` → `>=`。
+3. `buildFlux.py`：在 minDT/maxDT 钳制**之后**追加 `CFLtime = min(CFLtime, tEnd - tNow)`。
+
+### 4. 重启缺少 strata 文件的 bypass / Restart Strata Bypass (strataMesh.py)
+
+当 strata 已启用但重启文件 `sed.time*.hdf5` 缺失时，原代码抛出 `ValueError` 终止运行。此修改将其改为发出警告并将 `rstep` 重置为 0，允许模拟继续。
+
+> 注：修复 1（strata 可选化）从源头避免了 strataMesh 的创建，此 bypass 作为额外安全网保留。
+> Note: Fix 1 (optional strata) prevents strataMesh creation at the source; this bypass is kept as an additional safety net.
 
 ---
 
-## 如何使用新功能？
-## How to Use the New Feature?
+## 安装方法 / Installation
 
-修改完成后，你可以通过以下方式来控制是否生成文件：
+### 1. 备份原文件 / Backup Original Files
 
-After modification, you can control whether to generate files in the following ways:
+```bash
+BADLANDS_DIR=/path/to/site-packages/badlands
 
-1.  **正常模式 (生成文件) / Normal Mode (Generate Files)**
-    *适用于需要地层数据进行热力学计算的情况*
-    *Suitable for cases where strata data is needed for thermodynamic calculations*
+cp "$BADLANDS_DIR/model.py" "$BADLANDS_DIR/model.py.bak"
+cp "$BADLANDS_DIR/simulation/buildMesh.py" "$BADLANDS_DIR/simulation/buildMesh.py.bak"
+cp "$BADLANDS_DIR/simulation/buildFlux.py" "$BADLANDS_DIR/simulation/buildFlux.py.bak"
+cp "$BADLANDS_DIR/underland/strataMesh.py" "$BADLANDS_DIR/underland/strataMesh.py.bak"
+```
 
-    ```python
-    model.run_to_time(tEnd)
-    # 或者显式写出 / Or explicitly write
-    model.run_to_time(tEnd, generate_udw_strata=True)
-    ```
+### 2. 替换文件 / Replace Files
 
-2.  **忽略模式 (不生成文件) / Ignore Mode (No Generation)**
-    *适用于只需要地形演化，想节省时间的情况*
-    *Suitable for cases where only surface evolution is needed and you want to save time*
+```bash
+git clone https://github.com/HonghaoXiong/Badlands_coupling_fixedStrata.git
+cd Badlands_coupling_fixedStrata
 
-    ```python
-    model.run_to_time(tEnd, generate_udw_strata=False)
-    ```
+cp model.py      "$BADLANDS_DIR/model.py"
+cp buildMesh.py  "$BADLANDS_DIR/simulation/buildMesh.py"
+cp buildFlux.py  "$BADLANDS_DIR/simulation/buildFlux.py"
+cp strataMesh.py "$BADLANDS_DIR/underland/strataMesh.py"
+```
+
+### 3. 验证 / Verify
+
+```bash
+python -m py_compile "$BADLANDS_DIR/model.py"
+python -m py_compile "$BADLANDS_DIR/simulation/buildMesh.py"
+python -m py_compile "$BADLANDS_DIR/simulation/buildFlux.py"
+python -m py_compile "$BADLANDS_DIR/underland/strataMesh.py"
+```
+
+---
+
+## 跨机器检查清单 / Cross-Machine Checklist
+
+1. `model.py` 主循环：`tStop == tEnd` 时也调用 `sediment_flux`（`<=` 或 fluxTarget 写法）。
+2. `buildFlux.py`：`flow.compute_sedflux` 调用前，`CFLtime = min(CFLtime, tEnd - tNow)` 封顶位于 minDT/maxDT 钳制**之后**。
+3. `model.py` 主循环后：输出条件用 `>=` 而非 `==`；循环结束后 snap `tNow` 到 `tEnd`。
+4. 短步长耦合测试：确认 `tin.time1.hdf5` 及后续步的 `cumdiff` 非零，且每步都有输出。
+
+---
+
+## 合并说明 / Merge Note
+
+本仓库合并了以下两个仓库的内容 / This repository merges content from:
+
+- ~~`HonghaoXiong/Badlands-restart`~~ — strataMesh.py restart bypass（已合并到本仓库）
+- `HonghaoXiong/Badlands_coupling_fixedStrata` — model.py strata 可选化（本仓库为更新版）
+
+---
+
+## 免责声明 / Disclaimer
+
+These patches are provided "as is". Please ensure you understand the implications of these modifications for your specific simulation needs.
+
+本补丁"按原样"提供。请确保您了解这些修改对特定模拟需求可能产生的影响。
